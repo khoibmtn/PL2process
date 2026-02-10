@@ -1,164 +1,252 @@
 """
 File I/O module for PL2process.
-Handles Excel reading and writing using POSITION-BASED column identification.
+Handles Excel reading and writing with DYNAMIC sheet selection.
 
-IMPORTANT: Column headers are unreliable due to line breaks and formatting.
-All column identification is done by POSITION (0-indexed), not by header names.
+COLUMN NAMING CONVENTION (CASE-INSENSITIVE):
+Each sheet must have columns named with the sheet name as prefix:
+- {sheet_name}_stt: Record ID
+- {sheet_name}_chuong: Chapter/specialty
+- {sheet_name}_tenkt: Procedure name
+
+Example: Sheet "TT23" needs columns: tt23_stt, tt23_chuong, tt23_tenkt (any case)
 """
 
 import os
-from typing import Tuple, Optional, Dict
+from typing import Tuple, Optional, Dict, List
 import pandas as pd
 
-# ============================================================================
-# COLUMN SCHEMA - POSITION-BASED (0-indexed)
-# ============================================================================
 
-# PL1 Sheet Schema (Columns A-E, positions 0-4)
-# - Columns A-C (0-2) are INPUT
-# - Columns D-E (3-4) are OUTPUT (may be empty initially)
-PL1_SCHEMA = {
-    "pl1_stt": 0,       # Column A: PL1 procedure ID
-    "pl1_chuong": 1,    # Column B: PL1 specialty / medical field
-    "pl1_tenkt": 2,     # Column C: PL1 procedure name
-    "pl2_stt": 3,       # Column D: aggregated PL2 IDs (OUTPUT)
-    "pl2_tenkt": 4,     # Column E: aggregated PL2 procedure names (OUTPUT)
-}
-
-PL1_INPUT_COLUMNS = ["pl1_stt", "pl1_chuong", "pl1_tenkt"]  # Required for input
-PL1_MIN_COLUMNS = 3  # Minimum columns required (A, B, C)
-
-# PL2 Sheet Schema (Columns A-D, positions 0-3)
-# - Columns A, C, D (0, 2, 3) are used for preprocessing
-# - Column B (1) is pl2_stt2 and must be IGNORED
-PL2_SCHEMA = {
-    "pl2_stt": 0,       # Column A: PL2 procedure ID
-    "pl2_stt2": 1,      # Column B: secondary PL2 index (IGNORED)
-    "pl2_chuong": 2,    # Column C: PL2 anatomical field / intervention domain
-    "pl2_tenkt": 3,     # Column D: PL2 procedure name
-}
-
-PL2_INPUT_COLUMNS = ["pl2_stt", "pl2_chuong", "pl2_tenkt"]  # Used for preprocessing (excluding pl2_stt2)
-PL2_MIN_COLUMNS = 4  # Minimum columns required (A, B, C, D)
-
-
-def get_column_letter(index: int) -> str:
-    """Convert 0-indexed column position to Excel column letter (A, B, C, ...)"""
-    return chr(ord('A') + index)
-
-
-def read_excel_sheets(file) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], str]:
+def get_sheet_names(file) -> Tuple[List[str], str]:
     """
-    Read PL1 and PL2 sheets from an Excel file using POSITION-BASED column mapping.
+    Get all sheet names from an Excel file.
     
     Args:
         file: File path or file-like object (from Streamlit uploader)
         
     Returns:
-        Tuple of (df_pl1, df_pl2, error_message)
+        Tuple of (list of sheet names, error message)
         If successful, error_message is empty string
+    """
+    try:
+        xl = pd.ExcelFile(file)
+        return xl.sheet_names, ""
+    except Exception as e:
+        return [], f"Error reading Excel file: {str(e)}"
+
+
+def get_required_columns(sheet_name: str) -> List[str]:
+    """
+    Get the required column names for a given sheet (lowercase).
+    
+    Args:
+        sheet_name: Name of the sheet
         
-    Note:
-        - Headers are ignored; columns are identified by position only
-        - Internal alias names are applied based on position
+    Returns:
+        List of required column names (lowercase)
+    """
+    sheet_lower = sheet_name.lower()
+    return [
+        f"{sheet_lower}_stt",
+        f"{sheet_lower}_chuong",
+        f"{sheet_lower}_tenkt"
+    ]
+
+
+def find_column_case_insensitive(df: pd.DataFrame, target_col: str) -> Optional[str]:
+    """
+    Find a column in the dataframe matching target_col (case-insensitive).
+    
+    Args:
+        df: DataFrame to search
+        target_col: Target column name (lowercase)
+        
+    Returns:
+        Actual column name if found, None if not found
+    """
+    target_lower = target_col.lower()
+    for col in df.columns:
+        if str(col).lower() == target_lower:
+            return col
+    return None
+
+
+def validate_sheet_columns(df: pd.DataFrame, sheet_name: str) -> Tuple[str, Dict[str, str]]:
+    """
+    Validate that the sheet has all required columns (case-insensitive).
+    
+    Args:
+        df: DataFrame loaded from the sheet
+        sheet_name: Name of the sheet
+        
+    Returns:
+        Tuple of (error_message, column_mapping)
+        - error_message: Empty string if successful
+        - column_mapping: Dict mapping required column names to actual column names
+    """
+    required_cols = get_required_columns(sheet_name)
+    column_mapping = {}
+    missing_cols = []
+    
+    for req_col in required_cols:
+        actual_col = find_column_case_insensitive(df, req_col)
+        if actual_col:
+            column_mapping[req_col] = actual_col
+        else:
+            missing_cols.append(req_col)
+    
+    if missing_cols:
+        return (
+            f"Sheet '{sheet_name}' is missing required columns: {missing_cols}. "
+            f"Expected columns (case-insensitive): {required_cols}",
+            {}
+        )
+    
+    return "", column_mapping
+
+
+def normalize_columns(df: pd.DataFrame, sheet_name: str, column_mapping: Dict[str, str]) -> pd.DataFrame:
+    """
+    Rename columns to standardized lowercase names.
+    
+    Args:
+        df: Original DataFrame
+        sheet_name: Sheet name
+        column_mapping: Mapping from required names to actual names
+        
+    Returns:
+        DataFrame with standardized column names
+    """
+    result_df = df.copy()
+    sheet_lower = sheet_name.lower()
+    
+    # Create rename mapping: actual_name -> standardized_name
+    rename_map = {}
+    for req_col, actual_col in column_mapping.items():
+        # Standardize to lowercase sheet name
+        rename_map[actual_col] = req_col
+    
+    result_df = result_df.rename(columns=rename_map)
+    return result_df
+
+
+def read_sheet(file, sheet_name: str) -> Tuple[Optional[pd.DataFrame], str]:
+    """
+    Read a single sheet from an Excel file and validate its structure.
+    
+    Args:
+        file: File path or file-like object
+        sheet_name: Name of the sheet to read
+        
+    Returns:
+        Tuple of (DataFrame, error_message)
+        If successful, error_message is empty string
     """
     try:
         xl = pd.ExcelFile(file)
         
-        # Check for required sheets
-        if "PL1" not in xl.sheet_names:
-            return None, None, "Sheet 'PL1' not found in Excel file"
-        if "PL2" not in xl.sheet_names:
-            return None, None, "Sheet 'PL2' not found in Excel file"
+        if sheet_name not in xl.sheet_names:
+            return None, f"Sheet '{sheet_name}' not found in Excel file"
         
-        # Read sheets WITHOUT using headers - we'll assign our own column names
-        df_pl1_raw = pd.read_excel(xl, sheet_name="PL1", header=None)
-        df_pl2_raw = pd.read_excel(xl, sheet_name="PL2", header=None)
+        df = pd.read_excel(xl, sheet_name=sheet_name)
         
-        # Skip the first row (original header) and reset index
-        df_pl1_raw = df_pl1_raw.iloc[1:].reset_index(drop=True)
-        df_pl2_raw = df_pl2_raw.iloc[1:].reset_index(drop=True)
+        # Validate required columns (case-insensitive)
+        error, column_mapping = validate_sheet_columns(df, sheet_name)
+        if error:
+            return None, error
         
-        # ====================================================================
-        # Validate PL1 column count
-        # ====================================================================
-        if len(df_pl1_raw.columns) < PL1_MIN_COLUMNS:
-            missing_positions = [get_column_letter(i) for i in range(len(df_pl1_raw.columns), PL1_MIN_COLUMNS)]
-            return None, None, (
-                f"PL1: Expected at least {PL1_MIN_COLUMNS} columns (A-C), "
-                f"but found only {len(df_pl1_raw.columns)}. "
-                f"Missing column positions: {', '.join(missing_positions)}"
-            )
+        # Normalize column names to lowercase
+        df = normalize_columns(df, sheet_name, column_mapping)
         
-        # ====================================================================
-        # Validate PL2 column count
-        # ====================================================================
-        if len(df_pl2_raw.columns) < PL2_MIN_COLUMNS:
-            missing_positions = [get_column_letter(i) for i in range(len(df_pl2_raw.columns), PL2_MIN_COLUMNS)]
-            return None, None, (
-                f"PL2: Expected at least {PL2_MIN_COLUMNS} columns (A-D), "
-                f"but found only {len(df_pl2_raw.columns)}. "
-                f"Missing column positions: {', '.join(missing_positions)}"
-            )
+        return df, ""
         
-        # ====================================================================
-        # Apply internal alias names to PL1
-        # ====================================================================
-        df_pl1 = pd.DataFrame()
-        for alias, pos in PL1_SCHEMA.items():
-            if pos < len(df_pl1_raw.columns):
-                df_pl1[alias] = df_pl1_raw.iloc[:, pos]
-            else:
-                # Output columns (D, E) may not exist initially
-                df_pl1[alias] = ""
+    except Exception as e:
+        return None, f"Error reading sheet '{sheet_name}': {str(e)}"
+
+
+def read_two_sheets(
+    file, 
+    sheet1_name: str, 
+    sheet2_name: str
+) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], str]:
+    """
+    Read two sheets from an Excel file and validate their structure.
+    
+    Args:
+        file: File path or file-like object
+        sheet1_name: Name of the first sheet
+        sheet2_name: Name of the second sheet
         
-        # ====================================================================
-        # Apply internal alias names to PL2
-        # ====================================================================
-        df_pl2 = pd.DataFrame()
-        for alias, pos in PL2_SCHEMA.items():
-            if pos < len(df_pl2_raw.columns):
-                df_pl2[alias] = df_pl2_raw.iloc[:, pos]
-            else:
-                df_pl2[alias] = ""
+    Returns:
+        Tuple of (df_sheet1, df_sheet2, error_message)
+        If successful, error_message is empty string
+    """
+    try:
+        xl = pd.ExcelFile(file)
         
-        return df_pl1, df_pl2, ""
+        # Check both sheets exist
+        if sheet1_name not in xl.sheet_names:
+            return None, None, f"Sheet '{sheet1_name}' not found in Excel file"
+        if sheet2_name not in xl.sheet_names:
+            return None, None, f"Sheet '{sheet2_name}' not found in Excel file"
+        
+        # Read sheets
+        df1 = pd.read_excel(xl, sheet_name=sheet1_name)
+        df2 = pd.read_excel(xl, sheet_name=sheet2_name)
+        
+        # Validate columns (case-insensitive)
+        error1, col_map1 = validate_sheet_columns(df1, sheet1_name)
+        if error1:
+            return None, None, error1
+        
+        error2, col_map2 = validate_sheet_columns(df2, sheet2_name)
+        if error2:
+            return None, None, error2
+        
+        # Normalize column names to lowercase
+        df1 = normalize_columns(df1, sheet1_name, col_map1)
+        df2 = normalize_columns(df2, sheet2_name, col_map2)
+        
+        return df1, df2, ""
         
     except Exception as e:
         return None, None, f"Error reading Excel file: {str(e)}"
 
 
-def get_alias_descriptions() -> Dict[str, Dict[str, str]]:
+def get_column_mappings(sheet_name: str) -> Dict[str, str]:
     """
-    Return descriptions of all internal column aliases for UI display.
+    Get column alias mappings for a sheet.
     
+    Maps external column names to internal processing names.
+    
+    Args:
+        sheet_name: Name of the sheet
+        
     Returns:
-        Dictionary with 'PL1' and 'PL2' keys, each containing alias -> description mapping
+        Dictionary mapping external column names to internal names
     """
+    sheet_lower = sheet_name.lower()
     return {
-        "PL1": {
-            "pl1_stt": "PL1 procedure ID (Column A)",
-            "pl1_chuong": "PL1 specialty / medical field (Column B)",
-            "pl1_tenkt": "PL1 procedure name (Column C)",
-            "pl2_stt": "Aggregated PL2 IDs - OUTPUT (Column D)",
-            "pl2_tenkt": "Aggregated PL2 procedure names - OUTPUT (Column E)",
-        },
-        "PL2": {
-            "pl2_stt": "PL2 procedure ID (Column A)",
-            "pl2_stt2": "Secondary PL2 index - IGNORED (Column B)",
-            "pl2_chuong": "PL2 anatomical field (Column C)",
-            "pl2_tenkt": "PL2 procedure name (Column D)",
-        }
+        f"{sheet_lower}_stt": "stt",
+        f"{sheet_lower}_chuong": "chuong",
+        f"{sheet_lower}_tenkt": "tenkt"
     }
 
 
-def save_preprocessed(df_pl1: pd.DataFrame, df_pl2: pd.DataFrame, output_path: str) -> str:
+def save_preprocessed(
+    df1: pd.DataFrame, 
+    df2: pd.DataFrame, 
+    sheet1_name: str,
+    sheet2_name: str,
+    output_path: str
+) -> str:
     """
     Save preprocessed dataframes to an Excel file with two sheets.
     
     Args:
-        df_pl1: Preprocessed PL1 dataframe (with internal alias columns)
-        df_pl2: Preprocessed PL2 dataframe (with internal alias columns)
+        df1: Preprocessed dataframe for sheet 1
+        df2: Preprocessed dataframe for sheet 2
+        sheet1_name: Name of sheet 1
+        sheet2_name: Name of sheet 2
         output_path: Full path for the output Excel file
         
     Returns:
@@ -166,22 +254,64 @@ def save_preprocessed(df_pl1: pd.DataFrame, df_pl2: pd.DataFrame, output_path: s
     """
     try:
         with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-            df_pl1.to_excel(writer, sheet_name='PL1_PREPROCESSED', index=False)
-            df_pl2.to_excel(writer, sheet_name='PL2_PREPROCESSED', index=False)
+            df1.to_excel(writer, sheet_name=f'{sheet1_name}_PREPROCESSED', index=False)
+            df2.to_excel(writer, sheet_name=f'{sheet2_name}_PREPROCESSED', index=False)
         return ""
     except Exception as e:
         return f"Error saving Excel file: {str(e)}"
 
 
-def get_output_path(input_path: str) -> str:
+def export_results_to_excel(
+    df_output: pd.DataFrame,
+    df_output_expand: pd.DataFrame,
+    config: Dict,
+    timestamp=None
+) -> bytes:
     """
-    Generate output path in the same directory as input file.
+    Export matching results to Excel with three sheets.
+    
+    Sheets:
+    - output: Aggregated by MASTER
+    - output_expand: One row per match
+    - CONFIG_USED: Configuration parameters
     
     Args:
-        input_path: Path to the input Excel file
+        df_output: Aggregated output dataframe
+        df_output_expand: Expanded output dataframe
+        config: Configuration dictionary
+        timestamp: Execution timestamp
         
     Returns:
-        Path for the preprocessed output file
+        Excel file as bytes
     """
-    directory = os.path.dirname(input_path)
-    return os.path.join(directory, "preprocessed_output.xlsx")
+    import io
+    from datetime import datetime
+    
+    if timestamp is None:
+        timestamp = datetime.now()
+    
+    output = io.BytesIO()
+    
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        # Sheet 1: output (aggregated)
+        df_output.to_excel(writer, sheet_name='output', index=False)
+        
+        # Sheet 2: output_expand (one row per match)
+        df_output_expand.to_excel(writer, sheet_name='output_expand', index=False)
+        
+        # Sheet 3: CONFIG_USED
+        config_df = pd.DataFrame([{
+            "master_sheet": config.get("master_sheet", ""),
+            "match_sheet": config.get("match_sheet", ""),
+            "weight_name": config.get("weight_name", 0.7),
+            "weight_chuong": config.get("weight_chuong", 0.3),
+            "high_threshold": config.get("high_threshold", 80),
+            "medium_threshold": config.get("medium_threshold", 65),
+            "ai_enabled": config.get("ai_enabled", False),
+            "ai_provider": config.get("ai_provider", "local"),
+            "execution_timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S")
+        }])
+        config_df.to_excel(writer, sheet_name='CONFIG_USED', index=False)
+    
+    output.seek(0)
+    return output.getvalue()
